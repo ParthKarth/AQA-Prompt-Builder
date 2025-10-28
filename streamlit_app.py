@@ -263,9 +263,14 @@ def main():
             if response_health.status_code == 200:
                 health_data = response_health.json()
                 st.success("✅ RunPod Endpoint Online")
-                st.metric("Jobs Completed", health_data.get("jobs", {}).get("completed", "N/A"))
-            else:
-                st.error("❌ RunPod Endpoint Offline")
+                
+                # Safely get jobs completed if available
+                try:
+                    if isinstance(health_data, dict) and "jobs" in health_data:
+                        completed = health_data.get("jobs", {}).get("completed", "N/A")
+                        st.metric("Jobs Completed", completed)
+                except:
+                    pass  # Ignore if structure is unexpected
         except Exception as e:
             st.error(f"❌ Error checking endpoint: {e}")
 
@@ -838,7 +843,7 @@ def main():
                 )
         
         elif prompt_input_method == "Upload Prompts File (CSV/Excel)":
-            st.markdown("Upload a CSV or Excel file with columns: `question`, `prompt`")
+            st.markdown("Upload a CSV or Excel file with columns: `question_number`, `question`, `prompt`")
             
             prompts_file = st.file_uploader(
                 "Choose a prompts file",
@@ -860,17 +865,28 @@ def main():
                         st.error("❌ File must have 'question' and 'prompt' columns")
                         st.write(f"Found columns: {', '.join(prompts_df.columns)}")
                     else:
+                        # Add question_number if it doesn't exist
+                        if 'question_number' not in prompts_df.columns:
+                            prompts_df['question_number'] = range(1, len(prompts_df) + 1)
+                            st.info("ℹ️ Added 'question_number' column (1, 2, 3, ...)")
+                        
                         st.write(f"**Preview ({len(prompts_df)} rows):**")
                         st.dataframe(prompts_df.head(), use_container_width=True)
                         
-                        # Store in session state
+                        # Store in session state with question numbers
                         prompts_dict = {}
+                        prompts_with_numbers = {}
                         for _, row in prompts_df.iterrows():
                             prompts_dict[row['question']] = row['prompt']
+                            prompts_with_numbers[row['question']] = {
+                                'prompt': row['prompt'],
+                                'question_number': row['question_number']
+                            }
                         
                         st.session_state.bulk_test_prompts = {
                             'single': False,
                             'prompts': prompts_dict,
+                            'prompts_with_numbers': prompts_with_numbers,
                             'df': prompts_df
                         }
                 
@@ -968,33 +984,49 @@ def main():
                                             st.session_state.bulk_jobs.extend(bulk_job_ids)
                                 
                                 else:
-                                    # Multiple prompts - test all prompts against all transcripts
+                                    # Multiple prompts - send ALL prompts in ONE request per transcript
                                     prompts_dict = prompts_info['prompts']
-                                    total_jobs = len(df) * len(prompts_dict)
-                                    with st.spinner(f"Submitting {total_jobs} jobs to RunPod..."):
+                                    prompts_with_numbers = prompts_info.get('prompts_with_numbers', {})
+                                    
+                                    # Build combined prompt with all questions
+                                    questions_list = []
+                                    for q_idx, (question, prompt_text) in enumerate(prompts_dict.items(), 1):
+                                        question_num = prompts_with_numbers.get(question, {}).get('question_number', q_idx)
+                                        questions_list.append(f"Question {question_num}: {question}")
+                                    
+                                    combined_prompt = f"""Please evaluate the following {len(prompts_dict)} questions based on the transcript provided.
+
+QUESTIONS TO EVALUATE:
+{chr(10).join(questions_list)}
+
+For each question, please provide your answer in the JSON format below. Return an array of JSON objects, one for each question.
+""" + "\n\n".join([prompt_text for prompt_text in prompts_dict.values()])
+                                    
+                                    total_jobs = len(df)
+                                    with st.spinner(f"Submitting {total_jobs} jobs to RunPod (1 per transcript with all prompts)..."):
                                         bulk_job_ids = []
                                         
                                         for idx, row in df.iterrows():
                                             interaction_id = row['interactionid']
                                             transcript = row['transcript']
                                             
-                                            for question, prompt_text in prompts_dict.items():
-                                                job_id = submit_job(
-                                                    transcript,
-                                                    prompt_text,
-                                                    max_tokens,
-                                                    temperature
-                                                )
-                                                
-                                                if job_id:
-                                                    bulk_job_ids.append({
-                                                        'interactionid': interaction_id,
-                                                        'transcript': transcript,
-                                                        'job_id': job_id,
-                                                        'index': idx,
-                                                        'prompt': prompt_text[:50],
-                                                        'question': question
-                                                    })
+                                            # Single job per transcript with all prompts
+                                            job_id = submit_job(
+                                                transcript,
+                                                combined_prompt,
+                                                max_tokens,
+                                                temperature
+                                            )
+                                            
+                                            if job_id:
+                                                bulk_job_ids.append({
+                                                    'interactionid': interaction_id,
+                                                    'transcript': transcript,
+                                                    'job_id': job_id,
+                                                    'index': idx,
+                                                    'prompts': list(prompts_dict.keys()),  # Store all questions
+                                                    'prompts_with_numbers': prompts_with_numbers
+                                                })
                                         
                                         if bulk_job_ids:
                                             st.success(f"✅ Submitted {len(bulk_job_ids)} jobs!")
@@ -1028,7 +1060,16 @@ def main():
             if st.button("🔄 Check All Statuses"):
                 with st.spinner("Checking job statuses..."):
                     for job_info in st.session_state.bulk_jobs:
-                        if job_info['job_id'] not in st.session_state.bulk_results:
+                        # Check if this job is already processed
+                        if 'prompts' in job_info and len(job_info['prompts']) > 0:
+                            # Multi-prompt mode: check if any result exists for this job
+                            processed = any(key.startswith(f"{job_info['job_id']}_") for key in st.session_state.bulk_results.keys())
+                            should_process = not processed
+                        else:
+                            # Single prompt mode: check if job_id exists
+                            should_process = job_info['job_id'] not in st.session_state.bulk_results
+                        
+                        if should_process:
                             status = check_job_status(job_info['job_id'])
                             
                             if status.get('status') == 'COMPLETED':
@@ -1037,27 +1078,57 @@ def main():
                                     jsons = extract_jsons_from_response(response_text)
                                     
                                     if jsons:
-                                        st.session_state.bulk_results[job_info['job_id']] = {
-                                            'interactionid': job_info['interactionid'],
-                                            'transcript': job_info['transcript'],
-                                            'result': jsons[0] if jsons else None,
-                                            'index': job_info['index'],
-                                            'question': job_info.get('question', ''),
-                                            'prompt': job_info.get('prompt', '')
-                                        }
+                                        # Check if this job has multiple prompts (bulk multi-prompt mode)
+                                        if 'prompts' in job_info and len(job_info['prompts']) > 0:
+                                            # Process multiple responses for multiple prompts
+                                            prompts_list = job_info['prompts']
+                                            prompts_with_numbers = job_info.get('prompts_with_numbers', {})
+                                            
+                                            # Store each result separately
+                                            for i, json_result in enumerate(jsons):
+                                                if i < len(prompts_list):
+                                                    question = prompts_list[i]
+                                                    question_number = prompts_with_numbers.get(question, {}).get('question_number', '')
+                                                    
+                                                    st.session_state.bulk_results[f"{job_info['job_id']}_{i}"] = {
+                                                        'interactionid': job_info['interactionid'],
+                                                        'transcript': job_info['transcript'],
+                                                        'result': json_result,
+                                                        'index': job_info['index'],
+                                                        'question': question,
+                                                        'question_number': question_number,
+                                                        'prompt': 'Multi-Prompt'
+                                                    }
+                                        else:
+                                            # Single prompt mode
+                                            st.session_state.bulk_results[job_info['job_id']] = {
+                                                'interactionid': job_info['interactionid'],
+                                                'transcript': job_info['transcript'],
+                                                'result': jsons[0] if jsons else None,
+                                                'index': job_info['index'],
+                                                'question': job_info.get('question', ''),
+                                                'question_number': job_info.get('question_number', ''),
+                                                'prompt': job_info.get('prompt', '')
+                                            }
                                 except Exception as e:
                                     st.error(f"Error processing {job_info['interactionid']}: {e}")
+                            elif status.get('status') == 'IN_PROGRESS':
+                                pass  # Don't show message for every IN_PROGRESS
+                            elif status.get('status') == 'FAILED':
+                                st.error(f"❌ {job_info['interactionid']} - Failed")
                     
-                    st.rerun()
+                st.rerun()  # Rerun after checking all jobs
             
             # Display results
             if st.session_state.bulk_results:
-                # Convert to DataFrame for download
+                # Convert to DataFrame for download (pivoted format)
                 results_list = []
                 for job_id, result_data in st.session_state.bulk_results.items():
                     result = result_data['result']
                     if result:
+                        # Store both rating and explanation with question number
                         results_list.append({
+                            'question_number': result_data.get('question_number', ''),
                             'interactionid': result_data['interactionid'],
                             'question': result_data.get('question', result.get('question', result.get('Question', ''))),
                             'rating': result.get('rating', result.get('Rating', result.get('Answer', ''))),
@@ -1065,47 +1136,114 @@ def main():
                         })
                 
                 if results_list:
+                    # Create original DataFrame
                     results_df = pd.DataFrame(results_list)
                     
-                    st.write("**Results:**")
+                    st.write("**Results (Original Format):**")
                     st.dataframe(results_df, use_container_width=True)
                     
-                    # Download as CSV
-                    csv = results_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="📥 Download Results as CSV",
-                        data=csv,
-                        file_name=f"bulk_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
-                    
-                    # Download as Excel
-                    buffer = BytesIO()
-                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        results_df.to_excel(writer, sheet_name='Results', index=False)
-                        # Also add full transcript data
-                        if 'bulk_transcripts_df' in st.session_state:
-                            st.session_state.bulk_transcripts_df.to_excel(writer, sheet_name='Transcripts', index=False)
-                    
-                    st.download_button(
-                        label="📥 Download Results as Excel",
-                        data=buffer.getvalue(),
-                        file_name=f"bulk_results_{time.strftime('%Y%m%d_%H%M%S')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                    # Pivot the data: Questions as rows, InteractionIDs as columns
+                    try:
+                        # Add combined question label if question_number exists
+                        if 'question_number' in results_df.columns:
+                            results_df['question_label'] = results_df.apply(
+                                lambda row: f"Q{row['question_number']}: {row['question']}" if row['question_number'] else row['question'], 
+                                axis=1
+                            )
+                        else:
+                            results_df['question_label'] = results_df['question']
+                        
+                        # Create pivoted table with ratings
+                        rating_df = results_df.pivot_table(
+                            index='question_label',
+                            columns='interactionid',
+                            values='rating',
+                            aggfunc='first'
+                        )
+                        rating_df = rating_df.fillna('').reset_index()
+                        
+                        st.write("**Pivoted Results (Ratings by Question):**")
+                        st.dataframe(rating_df, use_container_width=True)
+                        
+                        # Download as CSV
+                        csv = rating_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download Ratings as CSV",
+                            data=csv,
+                            file_name=f"bulk_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
+                        
+                        # Download as Excel with multiple sheets
+                        buffer = BytesIO()
+                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                            # Pivoted ratings
+                            rating_df.to_excel(writer, sheet_name='Ratings (Pivoted)', index=False)
+                            
+                            # Create pivoted explanations
+                            explanation_df = results_df.pivot_table(
+                                index='question_label',
+                                columns='interactionid',
+                                values='explanation',
+                                aggfunc='first'
+                            )
+                            explanation_df = explanation_df.fillna('').reset_index()
+                            explanation_df.to_excel(writer, sheet_name='Explanations (Pivoted)', index=False)
+                            
+                            # Original format
+                            results_df.to_excel(writer, sheet_name='Original Format', index=False)
+                            
+                            # Transcripts
+                            if 'bulk_transcripts_df' in st.session_state:
+                                st.session_state.bulk_transcripts_df.to_excel(writer, sheet_name='Transcripts', index=False)
+                        
+                        st.download_button(
+                            label="📥 Download Results as Excel",
+                            data=buffer.getvalue(),
+                            file_name=f"bulk_results_{time.strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    except Exception as e:
+                        st.warning(f"Could not pivot results: {e}")
+                        # Fall back to original format if pivot fails
+                        csv = results_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download Results as CSV",
+                            data=csv,
+                            file_name=f"bulk_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
             
             # Display job list
             with st.expander("📋 Job Details"):
                 for job_info in st.session_state.bulk_jobs:
                     col1, col2 = st.columns([3, 1])
                     with col1:
-                        status = "✅ Completed" if job_info['job_id'] in st.session_state.bulk_results else "⏳ Pending"
-                        st.write(f"**{job_info['interactionid']}** - Job ID: `{job_info['job_id']}` - {status}")
+                        # Check status for multi-prompt or single-prompt jobs
+                        if 'prompts' in job_info and len(job_info['prompts']) > 0:
+                            # Multi-prompt mode: check if results exist
+                            exists = any(key.startswith(f"{job_info['job_id']}_") for key in st.session_state.bulk_results.keys())
+                            status = "✅ Completed" if exists else "⏳ Pending"
+                            prompt_count = f" ({len(job_info['prompts'])} prompts)" if 'prompts' in job_info else ""
+                        else:
+                            status = "✅ Completed" if job_info['job_id'] in st.session_state.bulk_results else "⏳ Pending"
+                            prompt_count = ""
+                        
+                        st.write(f"**{job_info['interactionid']}** - Job ID: `{job_info['job_id']}` - {status}{prompt_count}")
                     with col2:
                         if st.button("🗑️", key=f"bulk_remove_{job_info['job_id']}"):
                             st.session_state.bulk_jobs.remove(job_info)
-                            if job_info['job_id'] in st.session_state.bulk_results:
-                                del st.session_state.bulk_results[job_info['job_id']]
+                            
+                            # Remove all related results
+                            if 'prompts' in job_info and len(job_info['prompts']) > 0:
+                                # Remove multi-prompt results
+                                keys_to_remove = [key for key in st.session_state.bulk_results.keys() if key.startswith(f"{job_info['job_id']}_")]
+                                for key in keys_to_remove:
+                                    del st.session_state.bulk_results[key]
+                            else:
+                                # Single prompt result
+                                if job_info['job_id'] in st.session_state.bulk_results:
+                                    del st.session_state.bulk_results[job_info['job_id']]
                             st.rerun()
         else:
             st.info("👆 Upload a CSV/Excel file and click 'Start Bulk Testing'")
