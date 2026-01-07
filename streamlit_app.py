@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 # RunPod configuration
-RUNPOD_ENDPOINT_ID = "cj0k04fo6vknjh"
+RUNPOD_ENDPOINT_ID = "1bdc1p8ik57j0l"
 RUNPOD_API_KEY = "rpa_ARG4EDO1OIMKM70C4J04YBVR1685WN3VB46AFUSU1c54vp"
 RUNPOD_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run"
 HEADERS = {
@@ -1250,4 +1250,5 @@ For each question, please provide your answer in the JSON format below. Return a
 
 if __name__ == "__main__":
     main()
+
 
