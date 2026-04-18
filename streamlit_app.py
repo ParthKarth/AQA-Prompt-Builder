@@ -4,6 +4,7 @@ import json
 import time
 import re
 import ast
+import zipfile
 import pandas as pd
 import tiktoken
 from typing import List, Dict, Any
@@ -24,6 +25,19 @@ HEADERS = {
     "Authorization": f"Bearer {RUNPOD_API_KEY}",
     "Content-Type": "application/json"
 }
+
+# AssemblyAI configuration
+ASSEMBLYAI_API_KEY = "983624cdf57e4aeeacf8cddda003323d"
+ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
+ASSEMBLYAI_HEADERS = {"authorization": ASSEMBLYAI_API_KEY}
+
+PII_REDACT_POLICIES = [
+    "credit_card_number", "credit_card_expiration", "credit_card_cvv",
+    "us_social_security_number", "person_name", "phone_number",
+    "email_address", "date_of_birth", "banking_information",
+    "medical_condition", "medical_process", "blood_type",
+    "drug", "injury", "number_sequence",
+]
 
 # Token counting function
 def count_tokens(text: str) -> int:
@@ -246,6 +260,122 @@ def extract_jsons_from_response(raw_response: str) -> List[Dict]:
         st.error(f"Raw response: {raw_response[:500]}")
         return []
 
+# AssemblyAI transcription helpers
+def ms_to_mmss(milliseconds: int) -> str:
+    total_seconds = milliseconds // 1000
+    return f"{total_seconds // 60:02d}:{total_seconds % 60:02d}"
+
+
+def format_utterances(utterances: list) -> str:
+    if not utterances:
+        return ""
+    lines = []
+    for utt in utterances:
+        start = ms_to_mmss(utt.get("start", 0))
+        end = ms_to_mmss(utt.get("end", 0))
+        lines.append(f"Speaker {utt['speaker']} [starttime: {start}, endtime: {end}]: {utt['text']}")
+    return "\n\n".join(lines)
+
+
+def transcribe_local_file(file_bytes: bytes, filename: str, status_ui=None) -> Dict[str, Any]:
+    """Upload a local audio file to AssemblyAI, submit for transcription, poll, and return the result.
+
+    Returns a dict: {filename, status, formatted, raw, error}.
+    """
+    result: Dict[str, Any] = {
+        "filename": filename,
+        "status": "pending",
+        "formatted": "",
+        "raw": None,
+        "error": None,
+    }
+
+    def _update(msg: str):
+        if status_ui is not None:
+            try:
+                status_ui.update(label=msg)
+            except Exception:
+                pass
+
+    try:
+        _update(f"Uploading `{filename}` to AssemblyAI...")
+        upload_resp = requests.post(
+            f"{ASSEMBLYAI_BASE_URL}/v2/upload",
+            headers=ASSEMBLYAI_HEADERS,
+            data=file_bytes,
+            timeout=600,
+        )
+        if upload_resp.status_code != 200:
+            result["status"] = "error"
+            result["error"] = f"Upload failed ({upload_resp.status_code}): {upload_resp.text[:300]}"
+            return result
+        upload_url = upload_resp.json().get("upload_url")
+        if not upload_url:
+            result["status"] = "error"
+            result["error"] = "Upload succeeded but no upload_url returned"
+            return result
+
+        _update(f"Submitting `{filename}` for transcription...")
+        submit_body = {
+            "audio_url": upload_url,
+            "speech_models": ["universal-2"],
+            "speaker_labels": True,
+            "language_code": "en_us",
+            "redact_pii": True,
+            "redact_pii_policies": PII_REDACT_POLICIES,
+        }
+        submit_resp = requests.post(
+            f"{ASSEMBLYAI_BASE_URL}/v2/transcript",
+            headers={**ASSEMBLYAI_HEADERS, "content-type": "application/json"},
+            json=submit_body,
+            timeout=60,
+        )
+        if submit_resp.status_code != 200:
+            result["status"] = "error"
+            result["error"] = f"Submit failed ({submit_resp.status_code}): {submit_resp.text[:300]}"
+            return result
+        transcript_id = submit_resp.json().get("id")
+        if not transcript_id:
+            result["status"] = "error"
+            result["error"] = "Submit succeeded but no transcript id returned"
+            return result
+
+        poll_url = f"{ASSEMBLYAI_BASE_URL}/v2/transcript/{transcript_id}"
+        last_status = None
+        while True:
+            time.sleep(5)
+            poll_resp = requests.get(poll_url, headers=ASSEMBLYAI_HEADERS, timeout=60)
+            if poll_resp.status_code == 429:
+                time.sleep(5)
+                continue
+            if poll_resp.status_code != 200:
+                result["status"] = "error"
+                result["error"] = f"Poll failed ({poll_resp.status_code}): {poll_resp.text[:300]}"
+                return result
+            data = poll_resp.json()
+            status = data.get("status")
+            if status != last_status:
+                _update(f"`{filename}`: {status}...")
+                last_status = status
+            if status == "completed":
+                if data.get("utterances"):
+                    formatted = format_utterances(data["utterances"])
+                else:
+                    formatted = data.get("text", "")
+                result["status"] = "completed"
+                result["formatted"] = formatted
+                result["raw"] = data
+                return result
+            if status == "error":
+                result["status"] = "error"
+                result["error"] = data.get("error", "unknown error from AssemblyAI")
+                return result
+
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
 # Main Streamlit app
 def main():
     st.title("🔨 AQA Prompt Builder")
@@ -275,7 +405,7 @@ def main():
             st.error(f"❌ Error checking endpoint: {e}")
 
     # Create tabs for different sections
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 Build Prompt", "🚀 Test Prompt", "📊 Results", "📋 Batch Evaluation", "📦 Bulk Testing"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📝 Build Prompt", "🚀 Test Prompt", "📊 Results", "📋 Batch Evaluation", "📦 Bulk Testing", "🎙️ Transcribe"])
     
     # Tab 1: Build Prompt
     with tab1:
@@ -1248,7 +1378,140 @@ For each question, please provide your answer in the JSON format below. Return a
         else:
             st.info("👆 Upload a CSV/Excel file and click 'Start Bulk Testing'")
 
+    # Tab 6: Transcribe (AssemblyAI)
+    with tab6:
+        st.header("🎙️ Transcribe Audio Files via AssemblyAI")
+        st.markdown(
+            "Upload one or more local audio files. Each file is transcribed with "
+            "speaker labels and PII redaction (matching the batch pipeline)."
+        )
+
+        uploaded_audio_files = st.file_uploader(
+            "Upload audio files",
+            type=["wav", "mp3", "m4a", "mp4", "flac", "ogg", "webm"],
+            accept_multiple_files=True,
+            key="transcribe_audio_uploader",
+        )
+
+        col_a, col_b = st.columns([1, 4])
+        with col_a:
+            transcribe_clicked = st.button(
+                "🎙️ Transcribe",
+                disabled=not uploaded_audio_files,
+                key="transcribe_run_btn",
+            )
+        with col_b:
+            if st.button("🗑️ Clear Results", key="transcribe_clear_btn"):
+                if "transcribe_results" in st.session_state:
+                    del st.session_state["transcribe_results"]
+                if "transcribe_file_bytes" in st.session_state:
+                    del st.session_state["transcribe_file_bytes"]
+                st.rerun()
+
+        if transcribe_clicked and uploaded_audio_files:
+            if "transcribe_results" not in st.session_state:
+                st.session_state.transcribe_results = {}
+            if "transcribe_file_bytes" not in st.session_state:
+                st.session_state.transcribe_file_bytes = {}
+
+            total = len(uploaded_audio_files)
+            for idx, up_file in enumerate(uploaded_audio_files, 1):
+                file_bytes = up_file.getvalue()
+                st.session_state.transcribe_file_bytes[up_file.name] = file_bytes
+
+                with st.status(
+                    f"Processing {idx}/{total}: {up_file.name}",
+                    expanded=False,
+                ) as status_ui:
+                    result = transcribe_local_file(file_bytes, up_file.name, status_ui=status_ui)
+                    st.session_state.transcribe_results[up_file.name] = result
+                    if result["status"] == "completed":
+                        status_ui.update(label=f"✅ {up_file.name}", state="complete")
+                    else:
+                        status_ui.update(label=f"❌ {up_file.name} — {result.get('error', 'unknown')}", state="error")
+
+        # Display results
+        if st.session_state.get("transcribe_results"):
+            st.divider()
+            st.subheader("📋 Results")
+
+            results = st.session_state.transcribe_results
+            file_bytes_map = st.session_state.get("transcribe_file_bytes", {})
+
+            completed_count = sum(1 for r in results.values() if r["status"] == "completed")
+            error_count = sum(1 for r in results.values() if r["status"] == "error")
+            st.write(f"**{completed_count} completed**, **{error_count} failed**, **{len(results)} total**")
+
+            for fname, result in results.items():
+                status = result["status"]
+                icon = "✅" if status == "completed" else "❌"
+                header = f"{icon} {fname}"
+                if status == "completed" and result.get("raw"):
+                    raw = result["raw"]
+                    audio_dur = raw.get("audio_duration")
+                    speakers = len({u.get("speaker") for u in raw.get("utterances", [])})
+                    if audio_dur:
+                        header += f" — {audio_dur}s audio, {speakers} speaker(s)"
+
+                with st.expander(header, expanded=False):
+                    if fname in file_bytes_map:
+                        try:
+                            st.audio(file_bytes_map[fname])
+                        except Exception:
+                            pass
+
+                    if status == "error":
+                        st.error(result.get("error", "Unknown error"))
+                        continue
+
+                    formatted = result.get("formatted", "")
+                    raw = result.get("raw") or {}
+
+                    st.text_area(
+                        "Transcript",
+                        value=formatted,
+                        height=400,
+                        key=f"transcribe_text_{fname}",
+                    )
+
+                    stem = fname.rsplit(".", 1)[0]
+                    col_d1, col_d2 = st.columns(2)
+                    with col_d1:
+                        st.download_button(
+                            label="📥 Download .txt",
+                            data=formatted,
+                            file_name=f"{stem}.txt",
+                            mime="text/plain",
+                            key=f"transcribe_dl_txt_{fname}",
+                        )
+                    with col_d2:
+                        st.download_button(
+                            label="📥 Download raw .json",
+                            data=json.dumps(raw, indent=2),
+                            file_name=f"{stem}.json",
+                            mime="application/json",
+                            key=f"transcribe_dl_json_{fname}",
+                        )
+
+            # Bundle all successful results into a ZIP
+            successful = {k: v for k, v in results.items() if v["status"] == "completed"}
+            if successful:
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for fname, result in successful.items():
+                        stem = fname.rsplit(".", 1)[0]
+                        zf.writestr(f"formatted/{stem}.txt", result.get("formatted", ""))
+                        zf.writestr(f"raw/{stem}.json", json.dumps(result.get("raw") or {}, indent=2))
+
+                st.download_button(
+                    label=f"📦 Download all ({len(successful)}) as ZIP",
+                    data=zip_buffer.getvalue(),
+                    file_name=f"transcripts_{time.strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    key="transcribe_dl_zip",
+                )
+        else:
+            st.info("👆 Upload audio files above and click 'Transcribe' to begin.")
+
 if __name__ == "__main__":
     main()
-
-
